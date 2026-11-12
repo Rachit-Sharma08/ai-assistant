@@ -1,5 +1,5 @@
 import Groq from "groq-sdk";
-import { SYSTEM_PROMPT } from "../../../lib/config.js";
+import { DEFAULT_MODEL, FALLBACK_MODEL, SYSTEM_PROMPT } from "../../../lib/config.js";
 
 export const maxDuration = 60;
 
@@ -129,9 +129,8 @@ export async function POST(request) {
     },
     ...boundedMessages(body.messages),
   ];
-  const primaryModel = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
-  const fallbackModel =
-    process.env.GROQ_FALLBACK_MODEL || "openai/gpt-oss-20b";
+  const primaryModel = process.env.GROQ_MODEL || DEFAULT_MODEL;
+  const fallbackModel = process.env.GROQ_FALLBACK_MODEL || FALLBACK_MODEL;
 
   let opened;
   try {
