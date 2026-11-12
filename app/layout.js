@@ -19,7 +19,12 @@ const themeBoot = `try{var t=localStorage.getItem("rachits-assistant-theme");if(
 
 export default function RootLayout({ children }) {
   return (
-    <html lang="en" className={`${inter.variable} ${sourceSerif.variable}`}>
+    // suppressHydrationWarning: the theme boot script sets data-theme before React hydrates.
+    <html
+      lang="en"
+      className={`${inter.variable} ${sourceSerif.variable}`}
+      suppressHydrationWarning
+    >
       <body>
         <script dangerouslySetInnerHTML={{ __html: themeBoot }} />
         {children}
