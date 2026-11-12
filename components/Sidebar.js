@@ -54,7 +54,7 @@ export default function Sidebar({
         />
       ) : null}
       <aside
-        className={`sidebar fixed inset-y-0 left-0 z-40 w-[264px] flex-col border-r border-[var(--border)] bg-[var(--bg)]${stateClass}`}
+        className={`sidebar fixed inset-y-0 left-0 z-40 w-[264px] flex-col border-r border-[var(--border)] bg-[var(--bg)] lg:static lg:z-auto${stateClass}`}
         aria-label="Chat history sidebar"
       >
         <div className="flex items-center justify-between px-4 pb-1 pt-4">
