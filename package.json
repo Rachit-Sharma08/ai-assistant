@@ -13,6 +13,7 @@
     "react": "latest",
     "react-dom": "latest",
     "react-markdown": "latest",
+    "rehype-highlight": "^7.0.2",
     "remark-gfm": "latest"
   },
   "devDependencies": {
