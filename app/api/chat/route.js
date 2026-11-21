@@ -1,10 +1,14 @@
 import Groq from "groq-sdk";
 import {
   DEFAULT_MODEL,
+  DEFAULT_VISION_MODEL,
   FALLBACK_MODEL,
+  IMAGE_PLACEHOLDER,
+  MAX_REQUEST_IMAGES,
   SEARCH_SENTINEL,
   SOURCES_SENTINEL,
   SYSTEM_PROMPT,
+  VOICE_MODE_HINT,
 } from "../../../lib/config.js";
 import { searchWeb } from "../../../lib/search.js";
 
@@ -12,6 +16,8 @@ export const maxDuration = 60;
 
 const MAX_MESSAGES = 8;
 const MAX_MESSAGE_CHARACTERS = 8000;
+// Vercel JSON body limit is 4.5 MB — reject anything bigger with a clean 413.
+const MAX_PAYLOAD_CHARACTERS = 4_000_000;
 
 const WEB_SEARCH_TOOL = {
   type: "function",
@@ -52,7 +58,9 @@ function canRetryWithFallback(error) {
 }
 
 function errorResponse(error) {
-  return statusOf(error) === 429
+  const status = statusOf(error);
+  if (status === 413) return jsonError("payload_too_large", 413);
+  return status === 429
     ? jsonError("rate_limited", 429)
     : jsonError("server_error", 500);
 }
@@ -66,24 +74,95 @@ function todayInKolkata() {
   }).format(new Date());
 }
 
-function boundedMessages(messages) {
-  const recent = messages.slice(-MAX_MESSAGES).map(({ role, content }) => ({
-    role,
-    content,
+// Accepts plain-string content and OpenAI-style multimodal arrays.
+// Returns { role, text, images: [dataUrl...] } or null when unusable.
+function normalizeMessage(message) {
+  if (
+    !message ||
+    (message.role !== "user" && message.role !== "assistant")
+  ) {
+    return null;
+  }
+  const content = message.content;
+  if (typeof content === "string") {
+    return { role: message.role, text: content, images: [] };
+  }
+  if (Array.isArray(content)) {
+    let text = "";
+    const images = [];
+    for (const part of content) {
+      if (part?.type === "text" && typeof part.text === "string") {
+        text += text ? `\n${part.text}` : part.text;
+      } else if (
+        part?.type === "image_url" &&
+        typeof part.image_url?.url === "string"
+      ) {
+        images.push(part.image_url.url);
+      }
+    }
+    if (!text && images.length === 0) return null;
+    return { role: message.role, text, images };
+  }
+  return null;
+}
+
+function withPlaceholder(text) {
+  const base = String(text || "").trim();
+  return base ? `${base}\n${IMAGE_PLACEHOLDER}` : IMAGE_PLACEHOLDER;
+}
+
+// Keep image data only for the newest image messages that fit the budget;
+// everything older becomes a one-line placeholder text.
+function trimImages(list) {
+  let kept = 0;
+  for (let index = list.length - 1; index >= 0; index -= 1) {
+    const message = list[index];
+    if (message.images.length === 0) continue;
+    if (kept + message.images.length <= MAX_REQUEST_IMAGES) {
+      kept += message.images.length;
+    } else {
+      message.text = withPlaceholder(message.text);
+      message.images = [];
+    }
+  }
+  return list;
+}
+
+function boundedMessages(list) {
+  const recent = trimImages(list.slice(-MAX_MESSAGES)).map((message) => ({
+    ...message,
+    text: message.text.slice(-MAX_MESSAGE_CHARACTERS),
   }));
 
   const totalCharacters = () =>
-    recent.reduce((total, message) => total + message.content.length, 0);
+    recent.reduce((total, message) => total + message.text.length, 0);
 
   while (recent.length > 1 && totalCharacters() > MAX_MESSAGE_CHARACTERS) {
     recent.shift();
   }
 
-  if (recent.length === 1 && recent[0].content.length > MAX_MESSAGE_CHARACTERS) {
-    recent[0].content = recent[0].content.slice(-MAX_MESSAGE_CHARACTERS);
+  if (recent.length === 1 && recent[0].text.length > MAX_MESSAGE_CHARACTERS) {
+    recent[0].text = recent[0].text.slice(-MAX_MESSAGE_CHARACTERS);
   }
 
   return recent;
+}
+
+// Text-only messages stay plain strings (fast path unchanged); messages with
+// images become OpenAI-compatible multimodal content arrays.
+function toApiContent(message) {
+  if (message.images.length === 0) return message.text;
+  const parts = [];
+  parts.push({
+    type: "text",
+    text:
+      message.text.trim() ||
+      "Is image me kya hai? Simple Hinglish me samjhao.",
+  });
+  for (const url of message.images) {
+    parts.push({ type: "image_url", image_url: { url } });
+  }
+  return parts;
 }
 
 const BASE_OPTIONS = {
@@ -175,15 +254,14 @@ export async function POST(request) {
     return jsonError("server_error", 400);
   }
 
-  const isValid = body.messages.every(
-    (message) =>
-      message &&
-      (message.role === "user" || message.role === "assistant") &&
-      typeof message.content === "string",
-  );
-
-  if (!isValid) {
+  const normalized = body.messages.map(normalizeMessage).filter(Boolean);
+  if (normalized.length === 0) {
     return jsonError("server_error", 400);
+  }
+
+  const payloadCharacters = JSON.stringify(body.messages).length;
+  if (payloadCharacters > MAX_PAYLOAD_CHARACTERS) {
+    return jsonError("payload_too_large", 413);
   }
 
   const apiKey = process.env.GROQ_API_KEY;
@@ -191,15 +269,60 @@ export async function POST(request) {
     return jsonError("server_error", 500);
   }
 
+  const recent = boundedMessages(normalized);
+  const hasImages = recent.some((message) => message.images.length > 0);
+  const voiceMode = body.voice === true;
+
   const modelMessages = [
     {
       role: "system",
-      content: `${SYSTEM_PROMPT}\n\nToday's date in Asia/Kolkata: ${todayInKolkata()}`,
+      content: `${SYSTEM_PROMPT}\n\nToday's date in Asia/Kolkata: ${todayInKolkata()}${
+        voiceMode ? `\n\n${VOICE_MODE_HINT}` : ""
+      }`,
     },
-    ...boundedMessages(body.messages),
+    ...recent.map((message) => ({
+      role: message.role,
+      content: toApiContent(message),
+    })),
   ];
   const primaryModel = process.env.GROQ_MODEL || DEFAULT_MODEL;
   const fallbackModel = process.env.GROQ_FALLBACK_MODEL || FALLBACK_MODEL;
+  const visionModel = process.env.GROQ_VISION_MODEL || DEFAULT_VISION_MODEL;
+
+  const encoder = new TextEncoder();
+  let activeIterator = null;
+
+  const streamResponse = (opened) =>
+    new Response(
+      new ReadableStream({
+        async start(controller) {
+          activeIterator = opened.iterator;
+          await pipeStream(opened, controller, encoder);
+        },
+        cancel() {
+          if (typeof activeIterator?.return === "function") {
+            void activeIterator.return();
+          }
+        },
+      }),
+      {
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Cache-Control": "no-cache, no-transform",
+        },
+      },
+    );
+
+  // Vision turn: stream straight from the vision model — no search round
+  // (tool calling with images is the flaky path, skip it instead of failing).
+  if (hasImages) {
+    try {
+      const opened = await openModelStream(apiKey, visionModel, modelMessages);
+      return streamResponse(opened);
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
 
   // Non-streaming call with tools; errors keep the old status-code behavior.
   let completion;
@@ -222,9 +345,6 @@ export async function POST(request) {
   const choice = completion?.choices?.[0];
   const toolCall = choice?.message?.tool_calls?.[0];
   const wantsSearch = toolCall?.function?.name === "web_search";
-
-  const encoder = new TextEncoder();
-  let activeIterator = null;
 
   const responseStream = new ReadableStream({
     async start(controller) {
