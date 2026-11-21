@@ -99,6 +99,9 @@ export default function VoiceMode({
         : "recording_failed";
     }
     recorderRef.current = handle;
+    // Manual close/cancel rejects `done` before stop() is awaited — attach a
+    // handler now so it never surfaces as an unhandled rejection.
+    handle.done.catch(() => {});
     setPhase("listening");
     setElapsed(0);
 

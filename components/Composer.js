@@ -113,8 +113,8 @@ export default function Composer({
     }
   }
 
-  const canSend =
-    !isStreaming && (value.trim().length > 0 || images.some((image) => image.status === "ready"));
+  const hasSendable =
+    value.trim().length > 0 || images.some((image) => image.status === "ready");
   const showChips =
     onAddImages &&
     images.length > 0 &&
@@ -242,7 +242,7 @@ export default function Composer({
           <button
             type={isStreaming ? "button" : "submit"}
             onClick={isStreaming ? onStop : undefined}
-            disabled={!canSend}
+            disabled={!isStreaming && !hasSendable}
             aria-label={isStreaming ? "Generation rok do" : "Message bhejo"}
             className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-white transition-opacity duration-150 hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--surface-2)] disabled:text-[var(--text-muted)]"
           >
