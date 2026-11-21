@@ -8,6 +8,7 @@ import {
   IconPencil,
   IconRegenerate,
   IconSearch,
+  IconSpeaker,
   Sparkle,
 } from "./icons.js";
 
@@ -130,6 +131,7 @@ export default function ChatMessage({
   onCopy,
   onRegenerate,
   onEdit,
+  onSpeak,
 }) {
   const [lightboxUrl, setLightboxUrl] = useState(null);
 
@@ -202,6 +204,15 @@ export default function ChatMessage({
             ) : null}
             {!isStreaming || !isActiveAssistant ? (
               <div className="msg-actions mt-1.5 flex items-center gap-0.5">
+                {onSpeak ? (
+                  <ActionButton
+                    onClick={() => onSpeak(message)}
+                    aria-label="Ye jawab sunao"
+                  >
+                    <IconSpeaker className="h-3.5 w-3.5" />
+                    Suno
+                  </ActionButton>
+                ) : null}
                 <ActionButton
                   onClick={() => onCopy(message)}
                   aria-label={copiedId === message.id ? "Copy ho gaya" : "Message copy karo"}

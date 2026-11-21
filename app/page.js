@@ -5,7 +5,8 @@ import ChatMessage from "../components/ChatMessage.js";
 import Composer from "../components/Composer.js";
 import EmptyState from "../components/EmptyState.js";
 import Sidebar from "../components/Sidebar.js";
-import { IconArrowDown, IconSidebar, IconSpeaker, IconSpeakerOff, Sparkle } from "../components/icons.js";
+import { IconArrowDown, IconSidebar, IconSpeaker, IconSpeakerOff, IconWaveform, Sparkle } from "../components/icons.js";
+import VoiceMode from "../components/VoiceMode.js";
 import {
   APP_NAME,
   DEFAULT_IMAGE_PROMPT,
@@ -18,9 +19,17 @@ import {
 import { blobToDataUrl, compressImage } from "../lib/image-compress.js";
 import { deleteImage, getImage, putImage } from "../lib/image-store.js";
 import {
+  createSpeechRecognition,
+  recorderSupported,
+  speechRecognitionSupported,
+  startRecording,
+} from "../lib/recorder.js";
+import { STT_ERROR_MESSAGES, transcribeBlob } from "../lib/stt-client.js";
+import {
   extractSentences,
   flushSentences,
   speechQueue,
+  stripMarkdown,
 } from "../lib/speech-queue.js";
 import {
   createId,
@@ -31,6 +40,7 @@ import {
 
 const THEME_KEY = "rachits-assistant-theme";
 const SPEECH_KEY = "rachits-assistant-speech";
+const AUTOSEND_KEY = "rachits-assistant-autosend";
 
 const ERROR_MESSAGES = {
   rate_limited: "Free limit abhi full hai. 30-60 second baad dobara try karo.",
@@ -64,6 +74,13 @@ export default function ChatPage() {
   const [attachments, setAttachments] = useState([]);
   const [imageError, setImageError] = useState(null);
   const [dragging, setDragging] = useState(false);
+  // Voice input: "idle" | "recording" | "processing".
+  const [micState, setMicState] = useState({ mode: "idle", elapsedMs: 0 });
+  const [micError, setMicError] = useState(null);
+  const [micRetry, setMicRetry] = useState(false);
+  const [micAvailable, setMicAvailable] = useState(false);
+  const [autoSend, setAutoSend] = useState(false);
+  const [voiceOpen, setVoiceOpen] = useState(false);
 
   const textareaRef = useRef(null);
   const mainRef = useRef(null);
@@ -76,6 +93,11 @@ export default function ChatPage() {
   const pendingSpeechRef = useRef("");
   // Recent blobs in memory — IDB may be unavailable/full; resend still works.
   const blobCacheRef = useRef(new Map());
+  const recorderRef = useRef(null);
+  const recognitionRef = useRef(null);
+  const autoSendRef = useRef(false);
+  const voiceModeRef = useRef(false);
+  const preVoiceSpeechRef = useRef(false);
 
   const activeChat = chats.find((chat) => chat.id === activeId) || null;
   const messages = activeChat?.messages || [];
@@ -107,6 +129,15 @@ export default function ChatPage() {
       storedSpeech = null;
     }
     setSpeechOn(storedSpeech === "on");
+    let storedAuto = false;
+    try {
+      storedAuto = window.localStorage.getItem(AUTOSEND_KEY) === "on";
+    } catch {
+      storedAuto = false;
+    }
+    setAutoSend(storedAuto);
+    autoSendRef.current = storedAuto;
+    setMicAvailable(recorderSupported() || speechRecognitionSupported());
     setHydrated(true);
   }, []);
 
@@ -444,6 +475,7 @@ export default function ChatPage() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             messages: await buildRequestMessages(nextHistory.slice(-8)),
+            voice: voiceModeRef.current,
           }),
           signal: controller.signal,
         });
@@ -568,6 +600,190 @@ export default function ChatPage() {
     },
     [activeId, messages, patchChat, stopSpeech, attachments, clearAttachments, buildRequestMessages],
   );
+
+  /* ---- voice input: composer mic ---- */
+  const handleTranscript = useCallback(
+    (text) => {
+      if (!text) return;
+      if (autoSendRef.current) {
+        void sendMessage(text);
+      } else {
+        setDraft((previous) => (previous ? `${previous} ${text}` : text));
+        window.setTimeout(() => textareaRef.current?.focus(), 0);
+      }
+    },
+    [sendMessage],
+  );
+
+  const toggleAutoSend = useCallback(() => {
+    setAutoSend((previous) => {
+      const next = !previous;
+      autoSendRef.current = next;
+      try {
+        window.localStorage.setItem(AUTOSEND_KEY, next ? "on" : "off");
+      } catch {
+        // Storage blocked — the toggle still works for this session.
+      }
+      return next;
+    });
+  }, []);
+
+  // Web Speech fallback path (only when MediaRecorder is missing).
+  const startWebSpeech = useCallback(() => {
+    const recognition = createSpeechRecognition({
+      onResult: (text) => {
+        recognitionRef.current = null;
+        setMicState({ mode: "idle", elapsedMs: 0 });
+        handleTranscript(text);
+      },
+      onError: (code) => {
+        recognitionRef.current = null;
+        setMicState({ mode: "idle", elapsedMs: 0 });
+        if (code === "aborted") return;
+        if (code === "permission-denied" || code === "not-allowed") {
+          setMicError(STT_ERROR_MESSAGES.permission_denied);
+          setMicRetry(false);
+        } else if (code === "no-speech") {
+          setMicError(STT_ERROR_MESSAGES.no_speech);
+          setMicRetry(true);
+        } else if (code === "network") {
+          setMicError(
+            "Internet ka issue lag raha hai. Connection check karke dobara try karo.",
+          );
+          setMicRetry(true);
+        } else {
+          setMicError(STT_ERROR_MESSAGES.stt_failed);
+          setMicRetry(true);
+        }
+      },
+    });
+    if (!recognition) {
+      setMicError(STT_ERROR_MESSAGES.no_recorder);
+      setMicRetry(false);
+      return;
+    }
+    recognitionRef.current = recognition;
+    setMicState({ mode: "recording", elapsedMs: 0 });
+    recognition.start();
+  }, [handleTranscript]);
+
+  const micStart = useCallback(async () => {
+    setMicError(null);
+    setMicRetry(false);
+    if (!recorderSupported()) {
+      startWebSpeech();
+      return;
+    }
+    let handle;
+    try {
+      handle = await startRecording({
+        maxMs: 120000,
+        onTick: (elapsedMs) => setMicState({ mode: "recording", elapsedMs }),
+      });
+    } catch (code) {
+      if (code === "no_recorder") {
+        startWebSpeech();
+        return;
+      }
+      setMicError(
+        code === "permission_denied"
+          ? STT_ERROR_MESSAGES.permission_denied
+          : STT_ERROR_MESSAGES.recording_failed,
+      );
+      setMicRetry(code !== "permission_denied");
+      return;
+    }
+    recorderRef.current = handle;
+    setMicState({ mode: "recording", elapsedMs: 0 });
+    // `done` fires for manual stop AND the 2-minute auto-stop alike.
+    handle.done
+      .then(async ({ blob }) => {
+        if (recorderRef.current !== handle) return;
+        recorderRef.current = null;
+        setMicState({ mode: "processing", elapsedMs: 0 });
+        try {
+          const text = await transcribeBlob(blob);
+          if (text) handleTranscript(text);
+          else {
+            setMicError(STT_ERROR_MESSAGES.no_speech);
+            setMicRetry(true);
+          }
+        } catch (error) {
+          setMicError(
+            STT_ERROR_MESSAGES[error?.message] || STT_ERROR_MESSAGES.stt_failed,
+          );
+          setMicRetry(true);
+        } finally {
+          setMicState({ mode: "idle", elapsedMs: 0 });
+        }
+      })
+      .catch((error) => {
+        if (error?.message === "cancelled") return;
+        recorderRef.current = null;
+        setMicState({ mode: "idle", elapsedMs: 0 });
+        setMicError(
+          STT_ERROR_MESSAGES[error?.message] || STT_ERROR_MESSAGES.recording_failed,
+        );
+        setMicRetry(true);
+      });
+  }, [handleTranscript, startWebSpeech]);
+
+  const micStop = useCallback(() => {
+    if (recorderRef.current) {
+      void recorderRef.current.stop(); // done promise drives the rest
+    } else if (recognitionRef.current) {
+      recognitionRef.current.stop(); // confirm-stop: final result still lands
+    }
+  }, []);
+
+  const micCancel = useCallback(() => {
+    try {
+      recorderRef.current?.cancel();
+    } catch {
+      // already stopped
+    }
+    recorderRef.current = null;
+    recognitionRef.current?.cancel();
+    recognitionRef.current = null;
+    setMicState({ mode: "idle", elapsedMs: 0 });
+    setMicError(null);
+    setMicRetry(false);
+  }, []);
+
+  /* ---- voice mode (full-screen hands-free) ---- */
+  useEffect(() => {
+    voiceModeRef.current = voiceOpen;
+  }, [voiceOpen]);
+
+  const voiceSend = useCallback(
+    (text) => {
+      // Voice mode always speaks replies, independent of the auto-speak toggle.
+      speechOnRef.current = true;
+      setSpeechOn(true);
+      return text ? sendMessage(text) : Promise.resolve();
+    },
+    [sendMessage],
+  );
+
+  const voiceInterrupt = useCallback(() => {
+    stopSpeech();
+    abortRef.current?.abort();
+  }, [stopSpeech]);
+
+  const openVoiceMode = useCallback(() => {
+    preVoiceSpeechRef.current = speechOn;
+    setVoiceOpen(true);
+  }, [speechOn]);
+
+  const closeVoiceMode = useCallback(() => {
+    setVoiceOpen(false);
+    stopSpeech();
+    // Voice mode force-enabled speech — restore the user's own toggle.
+    if (!preVoiceSpeechRef.current) {
+      speechOnRef.current = false;
+      setSpeechOn(false);
+    }
+  }, [stopSpeech]);
 
   const submitDraft = useCallback(() => {
     const editUserId = editTargetRef.current;
@@ -729,6 +945,16 @@ export default function ChatPage() {
           >
             {speechOn ? <IconSpeaker /> : <IconSpeakerOff />}
           </button>
+          <button
+            type="button"
+            onClick={openVoiceMode}
+            aria-label="Voice mode kholo"
+            title="Voice mode (hands-free baat)"
+            data-testid="voice-mode-button"
+            className="rounded-lg p-2 text-[var(--text-muted)] transition-colors duration-150 hover:bg-[var(--surface)] hover:text-[var(--text)] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--accent)]"
+          >
+            <IconWaveform />
+          </button>
         </header>
 
         <main
@@ -762,6 +988,17 @@ export default function ChatPage() {
                   onAddImages={addFiles}
                   onRemoveImage={removeAttachment}
                   imageError={imageError}
+                  recording={micState.mode === "recording" ? micState : null}
+                  sttBusy={micState.mode === "processing"}
+                  micAvailable={micAvailable}
+                  micError={micError}
+                  micRetry={micRetry}
+                  autoSend={autoSend}
+                  onToggleAutoSend={toggleAutoSend}
+                  onMicStart={() => void micStart()}
+                  onMicStop={micStop}
+                  onMicCancel={micCancel}
+                  onMicRetry={() => void micStart()}
                 />
               </EmptyState>
             ) : (
@@ -778,6 +1015,9 @@ export default function ChatPage() {
                     onCopy={copyMessage}
                     onRegenerate={regenerate}
                     onEdit={editMessage}
+                    onSpeak={(target) =>
+                      speechQueue.enqueue(stripMarkdown(target.content))
+                    }
                   />
                 ))}
 
@@ -826,11 +1066,30 @@ export default function ChatPage() {
                 onAddImages={addFiles}
                 onRemoveImage={removeAttachment}
                 imageError={imageError}
+                recording={micState.mode === "recording" ? micState : null}
+                sttBusy={micState.mode === "processing"}
+                micAvailable={micAvailable}
+                micError={micError}
+                micRetry={micRetry}
+                autoSend={autoSend}
+                onToggleAutoSend={toggleAutoSend}
+                onMicStart={() => void micStart()}
+                onMicStop={micStop}
+                onMicCancel={micCancel}
+                onMicRetry={() => void micStart()}
               />
             </div>
           </footer>
         ) : null}
       </div>
+
+      <VoiceMode
+        open={voiceOpen}
+        onClose={closeVoiceMode}
+        onSend={voiceSend}
+        isStreaming={isStreaming}
+        onInterrupt={voiceInterrupt}
+      />
     </div>
   );
 }

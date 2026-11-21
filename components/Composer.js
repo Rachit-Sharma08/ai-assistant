@@ -1,8 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { IMAGE_CHIPS, MAX_IMAGES_PER_MESSAGE } from "../lib/config.js";
-import { IconPaperclip, IconSend, IconStop, IconX } from "./icons.js";
+import { IconCheck, IconMic, IconPaperclip, IconSend, IconStop, IconX } from "./icons.js";
 
 const MAX_ROWS = 8;
+
+function formatElapsed(ms) {
+  const total = Math.floor((ms || 0) / 1000);
+  return `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
+}
 
 // Thumbnail that owns its object URL (created on mount, revoked on unmount).
 function Thumb({ attachment, onRemove }) {
@@ -58,6 +63,17 @@ export default function Composer({
   onAddImages,
   onRemoveImage,
   imageError,
+  recording = null,
+  sttBusy = false,
+  micAvailable = false,
+  micError = null,
+  micRetry = false,
+  autoSend = false,
+  onToggleAutoSend,
+  onMicStart,
+  onMicStop,
+  onMicCancel,
+  onMicRetry,
 }) {
   const touchRef = useRef(false);
   const fileInputRef = useRef(null);
@@ -114,6 +130,47 @@ export default function Composer({
         }}
         className="composer-box rounded-3xl border border-[var(--border)] bg-[var(--surface)] p-2"
       >
+        {recording || sttBusy ? (
+          <div
+            className="mb-2 flex items-center gap-2.5 rounded-xl border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2"
+            data-testid="recording-bar"
+          >
+            <span
+              aria-hidden="true"
+              className={`h-2.5 w-2.5 shrink-0 rounded-full ${
+                sttBusy
+                  ? "animate-pulse bg-[var(--text-muted)]"
+                  : "animate-pulse bg-[var(--danger)]"
+              }`}
+            />
+            <span className="min-w-0 flex-1 truncate text-sm text-[var(--text)]" role="status">
+              {sttBusy
+                ? "Sun ke likh raha hu..."
+                : `Record ho raha hu... ${formatElapsed(recording?.elapsedMs)}`}
+            </span>
+            {!sttBusy ? (
+              <span className="flex shrink-0 gap-1">
+                <button
+                  type="button"
+                  onClick={onMicCancel}
+                  aria-label="Recording cancel karo"
+                  className="rounded-full p-2 text-[var(--text-muted)] transition-colors hover:bg-[var(--surface)] hover:text-[var(--text)] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--accent)]"
+                >
+                  <IconX className="h-4 w-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={onMicStop}
+                  aria-label="Recording rok kar bhejo"
+                  className="rounded-full bg-[var(--accent)] p-2 text-white transition-opacity hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--accent)]"
+                >
+                  <IconCheck className="h-4 w-4" />
+                </button>
+              </span>
+            ) : null}
+          </div>
+        ) : null}
+
         {images.length > 0 ? (
           <div className="mb-2 flex flex-wrap gap-2 px-1" data-testid="attachment-previews">
             {images.map((attachment) => (
@@ -151,6 +208,24 @@ export default function Composer({
                 <IconPaperclip />
               </button>
             </>
+          ) : null}
+
+          {onMicStart && micAvailable ? (
+            <button
+              type="button"
+              onClick={recording ? onMicStop : onMicStart}
+              disabled={sttBusy}
+              aria-label={recording ? "Recording rok do" : "Awaaz se likho"}
+              title="Awaaz se message likho"
+              data-testid="mic-button"
+              className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full transition-colors duration-150 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-40 ${
+                recording
+                  ? "bg-[var(--accent)] text-white"
+                  : "text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]"
+              }`}
+            >
+              <IconMic />
+            </button>
           ) : null}
 
           <textarea
@@ -195,6 +270,37 @@ export default function Composer({
         <p role="alert" className="mt-2 text-center text-xs text-[var(--danger)]">
           {imageError}
         </p>
+      ) : null}
+
+      {micError ? (
+        <p role="alert" className="mt-2 text-center text-xs text-[var(--danger)]">
+          {micError}
+          {micRetry && onMicRetry ? (
+            <>
+              {" "}
+              <button
+                type="button"
+                onClick={onMicRetry}
+                className="font-medium underline underline-offset-2 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--accent)]"
+              >
+                Dobara try karo
+              </button>
+            </>
+          ) : null}
+        </p>
+      ) : null}
+
+      {micAvailable && onToggleAutoSend ? (
+        <label className="mt-2 flex cursor-pointer items-center justify-center gap-2 text-xs text-[var(--text-muted)]">
+          <input
+            type="checkbox"
+            checked={autoSend}
+            onChange={onToggleAutoSend}
+            className="h-3.5 w-3.5 accent-[var(--accent)]"
+            data-testid="auto-send-toggle"
+          />
+          Bolne ke baad auto-send
+        </label>
       ) : null}
 
       <p className="mt-2 text-center text-xs text-[var(--text-muted)]">
