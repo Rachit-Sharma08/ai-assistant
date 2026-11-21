@@ -1,5 +1,12 @@
 import MarkdownRenderer from "./MarkdownRenderer.js";
-import { IconCheck, IconCopy, IconPencil, IconRegenerate, Sparkle } from "./icons.js";
+import {
+  IconCheck,
+  IconCopy,
+  IconPencil,
+  IconRegenerate,
+  IconSearch,
+  Sparkle,
+} from "./icons.js";
 
 function ActionButton({ onClick, ...props }) {
   return (
@@ -14,7 +21,15 @@ function ActionButton({ onClick, ...props }) {
   );
 }
 
-function ThinkingIndicator() {
+function ThinkingIndicator({ searching }) {
+  if (searching) {
+    return (
+      <div className="flex items-center gap-2 text-sm text-[var(--text-muted)]" role="status">
+        <IconSearch className="h-4 w-4 animate-pulse text-[var(--accent)]" />
+        <span className="font-sans">Web par search kar raha hu…</span>
+      </div>
+    );
+  }
   return (
     <div className="flex items-center gap-2 text-sm text-[var(--text-muted)]" role="status">
       <span className="inline-flex items-center gap-1" aria-hidden="true">
@@ -32,6 +47,7 @@ export default function ChatMessage({
   isStreaming,
   isActiveAssistant,
   isLastAssistant,
+  isSearching,
   copiedId,
   onCopy,
   onRegenerate,
@@ -69,13 +85,30 @@ export default function ChatMessage({
       </span>
       <div className="min-w-0 flex-1">
         {showThinking ? (
-          <ThinkingIndicator />
+          <ThinkingIndicator searching={isSearching} />
         ) : (
           <>
             <div className="assistant-text text-[var(--text)]">
               <MarkdownRenderer content={message.content} />
               {showCursor ? <span className="stream-cursor" aria-hidden="true" /> : null}
             </div>
+            {Array.isArray(message.sources) && message.sources.length > 0 ? (
+              <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
+                <span className="text-xs text-[var(--text-muted)]">Sources:</span>
+                {message.sources.map((source) => (
+                  <a
+                    key={source.link}
+                    href={source.link}
+                    target="_blank"
+                    rel="noreferrer noopener"
+                    aria-label={`Source: ${source.title || source.link}`}
+                    className="max-w-[240px] truncate rounded-full border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1 text-xs text-[var(--text-muted)] transition-colors duration-150 hover:bg-[var(--surface-2)] hover:text-[var(--text)] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--accent)]"
+                  >
+                    {source.title || source.link}
+                  </a>
+                ))}
+              </div>
+            ) : null}
             {!isStreaming || !isActiveAssistant ? (
               <div className="msg-actions mt-1.5 flex items-center gap-0.5">
                 <ActionButton

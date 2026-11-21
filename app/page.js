@@ -5,8 +5,13 @@ import ChatMessage from "../components/ChatMessage.js";
 import Composer from "../components/Composer.js";
 import EmptyState from "../components/EmptyState.js";
 import Sidebar from "../components/Sidebar.js";
-import { IconArrowDown, IconSidebar, Sparkle } from "../components/icons.js";
-import { APP_NAME } from "../lib/config.js";
+import { IconArrowDown, IconSidebar, IconSpeaker, IconSpeakerOff, Sparkle } from "../components/icons.js";
+import { APP_NAME, SEARCH_SENTINEL, SOURCES_SENTINEL } from "../lib/config.js";
+import {
+  extractSentences,
+  flushSentences,
+  speechQueue,
+} from "../lib/speech-queue.js";
 import {
   createId,
   loadChats,
@@ -15,6 +20,7 @@ import {
 } from "../lib/chat-store.js";
 
 const THEME_KEY = "rachits-assistant-theme";
+const SPEECH_KEY = "rachits-assistant-speech";
 
 const ERROR_MESSAGES = {
   rate_limited: "Free limit abhi full hai. 30-60 second baad dobara try karo.",
@@ -35,6 +41,8 @@ export default function ChatPage() {
   const [sidebarOpen, setSidebarOpen] = useState(null);
   const [theme, setTheme] = useState("dark");
   const [stickToBottom, setStickToBottom] = useState(true);
+  const [speechOn, setSpeechOn] = useState(false);
+  const [isSearching, setIsSearching] = useState(false);
 
   const textareaRef = useRef(null);
   const mainRef = useRef(null);
@@ -42,6 +50,9 @@ export default function ChatPage() {
   const activeRef = useRef(false);
   const stickRef = useRef(true);
   const editTargetRef = useRef(null);
+  const speechOnRef = useRef(false);
+  const speechCursorRef = useRef(0);
+  const pendingSpeechRef = useRef("");
 
   const activeChat = chats.find((chat) => chat.id === activeId) || null;
   const messages = activeChat?.messages || [];
@@ -66,7 +77,27 @@ export default function ChatPage() {
           : "dark";
     setTheme(initial);
     document.documentElement.setAttribute("data-theme", initial);
+    let storedSpeech = null;
+    try {
+      storedSpeech = window.localStorage.getItem(SPEECH_KEY);
+    } catch {
+      storedSpeech = null;
+    }
+    setSpeechOn(storedSpeech === "on");
     setHydrated(true);
+  }, []);
+
+  /* ---- keep speech ref in sync with state ---- */
+  useEffect(() => {
+    speechOnRef.current = speechOn;
+  }, [speechOn]);
+
+  /* ---- stop any speech + reset sentence buffers ---- */
+  const stopSpeech = useCallback(() => {
+    speechQueue.clear();
+    speechCursorRef.current = 0;
+    pendingSpeechRef.current = "";
+    setIsSearching(false);
   }, []);
 
   /* ---- persist chats (debounced so streaming doesn't spam storage) ---- */
@@ -136,6 +167,7 @@ export default function ChatPage() {
       editTargetRef.current = null;
       setErrorType(null);
       setCopiedId(null);
+      stopSpeech();
 
       const now = Date.now();
       const assistantId = createId();
@@ -217,6 +249,14 @@ export default function ChatPage() {
           ),
         }));
 
+      const setAssistantSources = (sources) =>
+        patchChat(chatId, (chat) => ({
+          ...chat,
+          messages: chat.messages.map((message) =>
+            message.id === assistantId ? { ...message, sources } : message,
+          ),
+        }));
+
       try {
         const response = await fetch("/api/chat", {
           method: "POST",
@@ -253,12 +293,65 @@ export default function ChatPage() {
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let responseText = "";
+        let sentinelHandled = false;
+        let sourcesPending = false;
 
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
           responseText += decoder.decode(value, { stream: true });
+
+          // Strip the server-side "Searching…" sentinel (it is always byte 0).
+          if (!sentinelHandled) {
+            if (responseText.length >= SEARCH_SENTINEL.length) {
+              if (responseText.startsWith(SEARCH_SENTINEL)) {
+                responseText = responseText.slice(SEARCH_SENTINEL.length);
+                setIsSearching(true);
+                sourcesPending = true;
+              }
+              sentinelHandled = true;
+            } else if (!SEARCH_SENTINEL.startsWith(responseText)) {
+              sentinelHandled = true;
+            } else {
+              continue; // partial sentinel — wait for more bytes
+            }
+          }
+
+          // After a search: one JSON line of [{title,link}] sources, then the answer.
+          if (sourcesPending) {
+            if (responseText.length === 0) {
+              // Search sentinel just stripped — the sources line may still be
+              // in flight (or search failed and content comes next). Keep waiting.
+            } else if (responseText.startsWith(SOURCES_SENTINEL)) {
+              const newline = responseText.indexOf("\n");
+              if (newline === -1) continue; // wait for the full line
+              try {
+                const parsed = JSON.parse(
+                  responseText.slice(SOURCES_SENTINEL.length, newline),
+                );
+                if (Array.isArray(parsed)) setAssistantSources(parsed);
+              } catch {
+                // Corrupt line — drop it, the answer still streams.
+              }
+              responseText = responseText.slice(newline + 1);
+              sourcesPending = false;
+            } else {
+              sourcesPending = false; // search failed/skipped — no sources line
+            }
+          }
+
+          if (responseText.length > 0) setIsSearching(false);
           setAssistantContent(responseText);
+
+          // TTS: split off any sentences that just completed and queue them.
+          if (speechOnRef.current) {
+            const delta = responseText.slice(speechCursorRef.current);
+            speechCursorRef.current = responseText.length;
+            pendingSpeechRef.current += delta;
+            const { sentences, rest } = extractSentences(pendingSpeechRef.current);
+            pendingSpeechRef.current = rest;
+            for (const sentence of sentences) speechQueue.enqueue(sentence);
+          }
         }
 
         const remainder = decoder.decode();
@@ -266,7 +359,20 @@ export default function ChatPage() {
           responseText += remainder;
           setAssistantContent(responseText);
         }
+
+        // Flush whatever is left as the final sentence(s).
+        if (speechOnRef.current) {
+          const delta = responseText.slice(speechCursorRef.current);
+          pendingSpeechRef.current += delta;
+          for (const sentence of flushSentences(pendingSpeechRef.current)) {
+            speechQueue.enqueue(sentence);
+          }
+        }
+        speechCursorRef.current = 0;
+        pendingSpeechRef.current = "";
+        setIsSearching(false);
       } catch (error) {
+        stopSpeech();
         if (error?.name === "AbortError") {
           dropAssistant();
         } else {
@@ -278,10 +384,11 @@ export default function ChatPage() {
         abortRef.current = null;
         setIsStreaming(false);
         setActiveAssistantId(null);
+        setIsSearching(false);
         patchChat(chatId, (chat) => ({ ...chat, updatedAt: Date.now() }));
       }
     },
-    [activeId, messages, patchChat],
+    [activeId, messages, patchChat, stopSpeech],
   );
 
   const submitDraft = useCallback(() => {
@@ -302,6 +409,7 @@ export default function ChatPage() {
 
   const startNewChat = useCallback(() => {
     abortRef.current?.abort();
+    stopSpeech();
     editTargetRef.current = null;
     setActiveId(null);
     setDraft("");
@@ -310,10 +418,11 @@ export default function ChatPage() {
     stickRef.current = true;
     setStickToBottom(true);
     if (isMobile()) setSidebarOpen(false);
-  }, []);
+  }, [stopSpeech]);
 
   const selectChat = useCallback((chatId) => {
     abortRef.current?.abort();
+    stopSpeech();
     editTargetRef.current = null;
     setActiveId(chatId);
     setDraft("");
@@ -322,7 +431,7 @@ export default function ChatPage() {
     stickRef.current = true;
     setStickToBottom(true);
     if (isMobile()) setSidebarOpen(false);
-  }, []);
+  }, [stopSpeech]);
 
   const renameChat = useCallback(
     (chatId, title) => patchChat(chatId, (chat) => ({ ...chat, title })),
@@ -331,14 +440,17 @@ export default function ChatPage() {
 
   const deleteChat = useCallback(
     (chatId) => {
-      if (chatId === activeId) abortRef.current?.abort();
+      if (chatId === activeId) {
+        abortRef.current?.abort();
+        stopSpeech();
+      }
       setChats((current) => current.filter((chat) => chat.id !== chatId));
       if (chatId === activeId) {
         setActiveId(null);
         setErrorType(null);
       }
     },
-    [activeId],
+    [activeId, stopSpeech],
   );
 
   const copyMessage = useCallback(async (message) => {
@@ -350,6 +462,19 @@ export default function ChatPage() {
       setCopiedId(null);
     }
   }, []);
+
+  const toggleSpeech = useCallback(() => {
+    setSpeechOn((previous) => {
+      const next = !previous;
+      try {
+        window.localStorage.setItem(SPEECH_KEY, next ? "on" : "off");
+      } catch {
+        // Storage blocked — the toggle still works for this session.
+      }
+      if (!next) stopSpeech();
+      return next;
+    });
+  }, [stopSpeech]);
 
   const lastAssistantId = [...messages]
     .reverse()
@@ -388,6 +513,20 @@ export default function ChatPage() {
             )}
             <span className="truncate">{activeChat?.title || APP_NAME}</span>
           </span>
+          <button
+            type="button"
+            onClick={toggleSpeech}
+            aria-pressed={speechOn}
+            aria-label={speechOn ? "Awaz band karo" : "Awaz chalu karo"}
+            title={speechOn ? "Awaz band karo" : "Awaz chalu karo"}
+            className={`ml-auto rounded-lg p-2 transition-colors duration-150 hover:bg-[var(--surface)] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--accent)] ${
+              speechOn
+                ? "text-[var(--accent)]"
+                : "text-[var(--text-muted)] hover:text-[var(--text)]"
+            }`}
+          >
+            {speechOn ? <IconSpeaker /> : <IconSpeakerOff />}
+          </button>
         </header>
 
         <main
@@ -428,6 +567,7 @@ export default function ChatPage() {
                     isStreaming={isStreaming}
                     isActiveAssistant={message.id === activeAssistantId}
                     isLastAssistant={message.id === lastAssistantId}
+                    isSearching={isSearching && message.id === activeAssistantId}
                     copiedId={copiedId}
                     onCopy={copyMessage}
                     onRegenerate={regenerate}

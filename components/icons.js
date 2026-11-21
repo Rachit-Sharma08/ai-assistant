@@ -132,6 +132,34 @@ export function IconX({ className = "h-5 w-5" }) {
   );
 }
 
+export function IconSearch({ className = "h-4 w-4" }) {
+  return (
+    <svg {...stroke} className={className}>
+      <circle cx="11" cy="11" r="6.5" />
+      <path d="M16 16l4.5 4.5" />
+    </svg>
+  );
+}
+
+export function IconSpeaker({ className = "h-5 w-5" }) {
+  return (
+    <svg {...stroke} className={className}>
+      <path d="M4 9.5v5h3.5L12 18.5v-13L7.5 9.5H4z" strokeLinejoin="round" />
+      <path d="M15.5 9.5a4 4 0 0 1 0 5" />
+      <path d="M18 7a8 8 0 0 1 0 10" />
+    </svg>
+  );
+}
+
+export function IconSpeakerOff({ className = "h-5 w-5" }) {
+  return (
+    <svg {...stroke} className={className}>
+      <path d="M4 9.5v5h3.5L12 18.5v-13L7.5 9.5H4z" strokeLinejoin="round" />
+      <path d="M16.5 9.5l5 5M21.5 9.5l-5 5" />
+    </svg>
+  );
+}
+
 export function Sparkle({ className = "h-5 w-5" }) {
   return (
     <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" className={className}>
