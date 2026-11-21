@@ -1,4 +1,7 @@
+import { useEffect, useState } from "react";
 import MarkdownRenderer from "./MarkdownRenderer.js";
+import Lightbox from "./Lightbox.js";
+import { getImage } from "../lib/image-store.js";
 import {
   IconCheck,
   IconCopy,
@@ -18,6 +21,81 @@ function ActionButton({ onClick, ...props }) {
     >
       {props.children}
     </button>
+  );
+}
+
+// Resolves image blobs from IndexedDB for display. Missing images degrade
+// to a placeholder — chat loading never breaks.
+function MessageImages({ images, onOpen }) {
+  const [urls, setUrls] = useState(null);
+
+  useEffect(() => {
+    let alive = true;
+    const objectUrls = [];
+    (async () => {
+      const resolved = [];
+      for (const image of images) {
+        const blob = await getImage(image.id);
+        if (!alive) return;
+        if (blob) {
+          const url = URL.createObjectURL(blob);
+          objectUrls.push(url);
+          resolved.push({ ...image, url });
+        } else {
+          resolved.push({ ...image, url: null });
+        }
+      }
+      if (alive) setUrls(resolved);
+    })();
+    return () => {
+      alive = false;
+      objectUrls.forEach((url) => URL.revokeObjectURL(url));
+    };
+  }, [images]);
+
+  if (urls === null) {
+    return (
+      <div className="mb-2 grid grid-cols-2 gap-1.5" aria-hidden="true">
+        {images.slice(0, 4).map((image) => (
+          <div
+            key={image.id}
+            className="h-24 animate-pulse rounded-xl bg-[var(--surface-2)]"
+          />
+        ))}
+      </div>
+    );
+  }
+
+  const columns =
+    urls.length === 1 ? "grid-cols-1" : urls.length === 2 ? "grid-cols-2" : "grid-cols-3";
+
+  return (
+    <div className={`mb-2 grid gap-1.5 ${columns}`} data-testid="message-images">
+      {urls.map((image) =>
+        image.url ? (
+          <button
+            key={image.id}
+            type="button"
+            onClick={() => onOpen(image.url)}
+            aria-label="Photo badi karke dekho"
+            className="overflow-hidden rounded-xl border border-[var(--border)] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--accent)]"
+          >
+            <img
+              src={image.url}
+              alt="User ne bheji photo"
+              className={`w-full object-cover ${urls.length === 1 ? "max-h-72" : "h-32"}`}
+            />
+          </button>
+        ) : (
+          <div
+            key={image.id}
+            className="flex h-24 items-center justify-center rounded-xl border border-dashed border-[var(--border)] bg-[var(--surface-2)] px-2 text-center text-[11px] text-[var(--text-muted)]"
+          >
+            Photo nahi mili
+          </div>
+        ),
+      )}
+    </div>
   );
 }
 
@@ -53,10 +131,16 @@ export default function ChatMessage({
   onRegenerate,
   onEdit,
 }) {
+  const [lightboxUrl, setLightboxUrl] = useState(null);
+
   if (message.role === "user") {
+    const hasImages = Array.isArray(message.images) && message.images.length > 0;
     return (
       <div className="group flex flex-col items-end gap-1">
         <div className="max-w-[80%] whitespace-pre-wrap break-words rounded-2xl bg-[var(--surface)] px-4 py-2.5 text-[15px] leading-[1.65] text-[var(--text)]">
+          {hasImages ? (
+            <MessageImages images={message.images} onOpen={setLightboxUrl} />
+          ) : null}
           {message.content}
         </div>
         <button
@@ -68,6 +152,13 @@ export default function ChatMessage({
           <IconPencil className="h-3.5 w-3.5" />
           Edit
         </button>
+        {lightboxUrl ? (
+          <Lightbox
+            src={lightboxUrl}
+            alt="Bheji gayi photo"
+            onClose={() => setLightboxUrl(null)}
+          />
+        ) : null}
       </div>
     );
   }
