@@ -59,3 +59,6 @@ next-env.d.ts
 # Note: `.env*` and `!.env.example` are already handled near the top of this
 # file. Do not re-add `.env*` below, or it would shadow that negation.
 .vercel
+
+# Playwright MCP test artifacts
+.playwright-mcp/
