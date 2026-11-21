@@ -168,3 +168,28 @@ export function Sparkle({ className = "h-5 w-5" }) {
     </svg>
   );
 }
+
+export function IconPaperclip({ className = "h-4 w-4" }) {
+  return (
+    <svg {...stroke} className={className}>
+      <path d="M21 11.5 12.5 20a5 5 0 0 1-7-7l8-8a3.5 3.5 0 0 1 5 5l-8 8a2 2 0 0 1-3-3l7.5-7.5" />
+    </svg>
+  );
+}
+
+export function IconMic({ className = "h-4 w-4" }) {
+  return (
+    <svg {...stroke} className={className}>
+      <rect x="9" y="3" width="6" height="11" rx="3" />
+      <path d="M5 11a7 7 0 0 0 14 0M12 18v3" />
+    </svg>
+  );
+}
+
+export function IconWaveform({ className = "h-5 w-5" }) {
+  return (
+    <svg {...stroke} strokeWidth={2} className={className}>
+      <path d="M3 12h1.5M7 7.5v9M11 4.5v15M15 8v8M18.5 10.5v3M21 12h.5" />
+    </svg>
+  );
+}

@@ -1,7 +1,51 @@
-import { useEffect, useRef } from "react";
-import { IconSend, IconStop } from "./icons.js";
+import { useEffect, useRef, useState } from "react";
+import { IMAGE_CHIPS, MAX_IMAGES_PER_MESSAGE } from "../lib/config.js";
+import { IconPaperclip, IconSend, IconStop, IconX } from "./icons.js";
 
 const MAX_ROWS = 8;
+
+// Thumbnail that owns its object URL (created on mount, revoked on unmount).
+function Thumb({ attachment, onRemove }) {
+  const [url, setUrl] = useState(null);
+
+  useEffect(() => {
+    if (!attachment.blob) {
+      setUrl(null);
+      return undefined;
+    }
+    const next = URL.createObjectURL(attachment.blob);
+    setUrl(next);
+    return () => URL.revokeObjectURL(next);
+  }, [attachment.blob]);
+
+  return (
+    <div className="relative h-16 w-16 shrink-0 overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface-2)]">
+      {url ? (
+        <img
+          src={url}
+          alt="Attach ki gayi photo"
+          className="h-full w-full object-cover"
+        />
+      ) : (
+        <span
+          className="flex h-full w-full items-center justify-center"
+          role="status"
+          aria-label="Photo taiyar ho rahi hai"
+        >
+          <span className="h-5 w-5 animate-spin rounded-full border-2 border-[var(--surface)] border-t-[var(--accent)]" />
+        </span>
+      )}
+      <button
+        type="button"
+        onClick={() => onRemove(attachment.id)}
+        aria-label="Ye photo hatao"
+        className="absolute right-0.5 top-0.5 rounded-full bg-black/70 p-1 text-white transition-colors hover:bg-black focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--accent)]"
+      >
+        <IconX className="h-3 w-3" />
+      </button>
+    </div>
+  );
+}
 
 export default function Composer({
   value,
@@ -10,8 +54,13 @@ export default function Composer({
   onStop,
   isStreaming,
   textareaRef,
+  images = [],
+  onAddImages,
+  onRemoveImage,
+  imageError,
 }) {
   const touchRef = useRef(false);
+  const fileInputRef = useRef(null);
 
   useEffect(() => {
     touchRef.current = window.matchMedia("(pointer: coarse)").matches;
@@ -36,6 +85,26 @@ export default function Composer({
     }
   }
 
+  function handlePaste(event) {
+    if (!onAddImages) return;
+    const files = Array.from(event.clipboardData?.items || [])
+      .filter((item) => item.kind === "file")
+      .map((item) => item.getAsFile())
+      .filter(Boolean);
+    if (files.length > 0) {
+      event.preventDefault();
+      onAddImages(files);
+    }
+  }
+
+  const canSend =
+    !isStreaming && (value.trim().length > 0 || images.some((image) => image.status === "ready"));
+  const showChips =
+    onAddImages &&
+    images.length > 0 &&
+    !value.trim() &&
+    images.every((image) => image.status === "ready");
+
   return (
     <div className="w-full">
       <form
@@ -43,28 +112,91 @@ export default function Composer({
           event.preventDefault();
           onSubmit();
         }}
-        className="composer-box flex items-end gap-2 rounded-3xl border border-[var(--border)] bg-[var(--surface)] p-2"
+        className="composer-box rounded-3xl border border-[var(--border)] bg-[var(--surface)] p-2"
       >
-        <textarea
-          ref={textareaRef}
-          rows={1}
-          value={value}
-          onChange={(event) => onChange(event.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder="Kuch bhi pucho..."
-          aria-label="Message"
-          className="max-h-[192px] min-h-[44px] min-w-0 flex-1 resize-none overflow-y-hidden bg-transparent px-3 py-2.5 text-[15px] leading-[1.6] text-[var(--text)] outline-none placeholder:text-[var(--text-muted)]"
-        />
-        <button
-          type={isStreaming ? "button" : "submit"}
-          onClick={isStreaming ? onStop : undefined}
-          disabled={!isStreaming && !value.trim()}
-          aria-label={isStreaming ? "Generation rok do" : "Message bhejo"}
-          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-white transition-opacity duration-150 hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--surface-2)] disabled:text-[var(--text-muted)]"
-        >
-          {isStreaming ? <IconStop className="h-3.5 w-3.5" /> : <IconSend />}
-        </button>
+        {images.length > 0 ? (
+          <div className="mb-2 flex flex-wrap gap-2 px-1" data-testid="attachment-previews">
+            {images.map((attachment) => (
+              <Thumb
+                key={attachment.id}
+                attachment={attachment}
+                onRemove={onRemoveImage}
+              />
+            ))}
+          </div>
+        ) : null}
+
+        <div className="flex items-end gap-2">
+          {onAddImages ? (
+            <>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/png,image/jpeg,image/webp,image/gif"
+                multiple
+                hidden
+                onChange={(event) => {
+                  onAddImages(Array.from(event.target.files || []));
+                  event.target.value = "";
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                aria-label="Photo attach karo"
+                title={`Photo attach karo (max ${MAX_IMAGES_PER_MESSAGE})`}
+                disabled={images.length >= MAX_IMAGES_PER_MESSAGE}
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-[var(--text-muted)] transition-colors duration-150 hover:bg-[var(--surface-2)] hover:text-[var(--text)] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <IconPaperclip />
+              </button>
+            </>
+          ) : null}
+
+          <textarea
+            ref={textareaRef}
+            rows={1}
+            value={value}
+            onChange={(event) => onChange(event.target.value)}
+            onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
+            placeholder="Kuch bhi pucho..."
+            aria-label="Message"
+            className="max-h-[192px] min-h-[44px] min-w-0 flex-1 resize-none overflow-y-hidden bg-transparent px-3 py-2.5 text-[15px] leading-[1.6] text-[var(--text)] outline-none placeholder:text-[var(--text-muted)]"
+          />
+          <button
+            type={isStreaming ? "button" : "submit"}
+            onClick={isStreaming ? onStop : undefined}
+            disabled={!canSend}
+            aria-label={isStreaming ? "Generation rok do" : "Message bhejo"}
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-white transition-opacity duration-150 hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--surface-2)] disabled:text-[var(--text-muted)]"
+          >
+            {isStreaming ? <IconStop className="h-3.5 w-3.5" /> : <IconSend />}
+          </button>
+        </div>
       </form>
+
+      {showChips ? (
+        <div className="mt-2 flex flex-wrap gap-1.5" data-testid="image-chips">
+          {IMAGE_CHIPS.map((chip) => (
+            <button
+              key={chip}
+              type="button"
+              onClick={() => onChange(chip)}
+              className="rounded-full border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-xs text-[var(--text-muted)] transition-colors duration-150 hover:bg-[var(--surface-2)] hover:text-[var(--text)] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--accent)]"
+            >
+              {chip}
+            </button>
+          ))}
+        </div>
+      ) : null}
+
+      {imageError ? (
+        <p role="alert" className="mt-2 text-center text-xs text-[var(--danger)]">
+          {imageError}
+        </p>
+      ) : null}
+
       <p className="mt-2 text-center text-xs text-[var(--text-muted)]">
         AI galti kar sakta hai. Zaroori baaton ko verify karo.
       </p>

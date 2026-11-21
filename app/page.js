@@ -6,7 +6,17 @@ import Composer from "../components/Composer.js";
 import EmptyState from "../components/EmptyState.js";
 import Sidebar from "../components/Sidebar.js";
 import { IconArrowDown, IconSidebar, IconSpeaker, IconSpeakerOff, Sparkle } from "../components/icons.js";
-import { APP_NAME, SEARCH_SENTINEL, SOURCES_SENTINEL } from "../lib/config.js";
+import {
+  APP_NAME,
+  DEFAULT_IMAGE_PROMPT,
+  IMAGE_PLACEHOLDER,
+  MAX_IMAGES_PER_MESSAGE,
+  MAX_REQUEST_IMAGES,
+  SEARCH_SENTINEL,
+  SOURCES_SENTINEL,
+} from "../lib/config.js";
+import { blobToDataUrl, compressImage } from "../lib/image-compress.js";
+import { deleteImage, getImage, putImage } from "../lib/image-store.js";
 import {
   extractSentences,
   flushSentences,
@@ -26,6 +36,13 @@ const ERROR_MESSAGES = {
   rate_limited: "Free limit abhi full hai. 30-60 second baad dobara try karo.",
   network_error: "Internet ka issue lag raha hai. Connection check karke dobara try karo.",
   server_error: "Kuch gadbad ho gayi. Dobara try karo.",
+  payload_too_large: "Photo bhejne ka size zyada ho gaya. Kam photo ya chhoti photo try karo.",
+};
+
+const IMAGE_ERRORS = {
+  unsupported: "Sirf PNG, JPG, WEBP aur GIF file chalegi.",
+  decode_failed: "Ye photo padhi nahi ja sakti — doosri photo try karo.",
+  too_many: `Ek message me maximum ${MAX_IMAGES_PER_MESSAGE} photo ja sakti hain.`,
 };
 
 export default function ChatPage() {
@@ -43,6 +60,10 @@ export default function ChatPage() {
   const [stickToBottom, setStickToBottom] = useState(true);
   const [speechOn, setSpeechOn] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
+  // Pending photo attachments: { id, blob?, width?, height?, status }.
+  const [attachments, setAttachments] = useState([]);
+  const [imageError, setImageError] = useState(null);
+  const [dragging, setDragging] = useState(false);
 
   const textareaRef = useRef(null);
   const mainRef = useRef(null);
@@ -53,6 +74,8 @@ export default function ChatPage() {
   const speechOnRef = useRef(false);
   const speechCursorRef = useRef(0);
   const pendingSpeechRef = useRef("");
+  // Recent blobs in memory — IDB may be unavailable/full; resend still works.
+  const blobCacheRef = useRef(new Map());
 
   const activeChat = chats.find((chat) => chat.id === activeId) || null;
   const messages = activeChat?.messages || [];
@@ -157,10 +180,148 @@ export default function ChatPage() {
     });
   }, []);
 
+  /* ---- photo attachments ---- */
+  const addFiles = useCallback(
+    async (fileList) => {
+      const files = Array.from(fileList || []).filter(Boolean);
+      if (files.length === 0) return;
+      setImageError(null);
+
+      const room = MAX_IMAGES_PER_MESSAGE - attachments.length;
+      if (room <= 0) {
+        setImageError(IMAGE_ERRORS.too_many);
+        return;
+      }
+      if (files.length > room) setImageError(IMAGE_ERRORS.too_many);
+      const chosen = files.slice(0, Math.max(room, 0));
+
+      const placeholders = chosen.map((file) => ({
+        id: createId(),
+        file,
+        status: "processing",
+      }));
+      setAttachments((current) => [...current, ...placeholders]);
+
+      for (const placeholder of placeholders) {
+        try {
+          const { blob, width, height } = await compressImage(placeholder.file);
+          setAttachments((current) =>
+            current.map((attachment) =>
+              attachment.id === placeholder.id
+                ? { ...attachment, blob, width, height, status: "ready" }
+                : attachment,
+            ),
+          );
+        } catch (error) {
+          setAttachments((current) =>
+            current.filter((attachment) => attachment.id !== placeholder.id),
+          );
+          setImageError(IMAGE_ERRORS[error?.message] || IMAGE_ERRORS.decode_failed);
+        }
+      }
+    },
+    [attachments.length],
+  );
+
+  const removeAttachment = useCallback((id) => {
+    setImageError(null);
+    setAttachments((current) =>
+      current.filter((attachment) => attachment.id !== id),
+    );
+  }, []);
+
+  const clearAttachments = useCallback(() => setAttachments([]), []);
+
+  /* ---- drag & drop photos onto the chat ---- */
+  const handleDragOver = useCallback((event) => {
+    const types = Array.from(event.dataTransfer?.types || []);
+    if (!types.includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    setDragging(true);
+  }, []);
+
+  const handleDragLeave = useCallback((event) => {
+    if (event.currentTarget.contains(event.relatedTarget)) return;
+    setDragging(false);
+  }, []);
+
+  const handleDrop = useCallback(
+    (event) => {
+      const files = Array.from(event.dataTransfer?.files || []);
+      if (files.length === 0) return;
+      event.preventDefault();
+      setDragging(false);
+      void addFiles(files);
+    },
+    [addFiles],
+  );
+
+  const getImageBlob = useCallback(async (id) => {
+    const cached = blobCacheRef.current.get(id);
+    if (cached) return cached;
+    const stored = await getImage(id);
+    if (stored) blobCacheRef.current.set(id, stored);
+    return stored || null;
+  }, []);
+
+  // Mirrors the server rule: only the newest images travel as data, older
+  // image messages are replaced with a one-line placeholder text.
+  const buildRequestMessages = useCallback(
+    async (list) => {
+      const result = new Array(list.length);
+      let kept = 0;
+      for (let index = list.length - 1; index >= 0; index -= 1) {
+        const message = list[index];
+        const meta = Array.isArray(message.images) ? message.images : [];
+        let text = message.content;
+        const dataUrls = [];
+
+        if (meta.length > 0 && kept + meta.length <= MAX_REQUEST_IMAGES) {
+          for (const image of meta) {
+            const blob = await getImageBlob(image.id);
+            if (blob) {
+              dataUrls.push(await blobToDataUrl(blob));
+              kept += 1;
+            }
+          }
+        }
+        if (meta.length > 0 && dataUrls.length === 0) {
+          text = `${text}\n${IMAGE_PLACEHOLDER}`;
+        }
+
+        result[index] =
+          dataUrls.length > 0
+            ? {
+                role: message.role,
+                content: [
+                  { type: "text", text },
+                  ...dataUrls.map((url) => ({
+                    type: "image_url",
+                    image_url: { url },
+                  })),
+                ],
+              }
+            : { role: message.role, content: text };
+      }
+      return result;
+    },
+    [getImageBlob],
+  );
+
   /* ---- sending ---- */
   const sendMessage = useCallback(
     async (rawText, options = {}) => {
-      const content = rawText.trim();
+      const readyImages = attachments.filter(
+        (attachment) => attachment.status === "ready" && attachment.blob,
+      );
+      if (attachments.some((attachment) => attachment.status === "processing")) {
+        setImageError("Photo abhi taiyar ho rahi hai — ek second ruko.");
+        return;
+      }
+      const content =
+        rawText.trim() ||
+        (readyImages.length > 0 ? DEFAULT_IMAGE_PROMPT : "");
       if (!content || activeRef.current) return;
 
       activeRef.current = true;
@@ -192,9 +353,28 @@ export default function ChatPage() {
         }
         history = messages.slice(0, index + 1);
       } else {
+        // Persist image blobs first so resend/refresh can find them.
+        for (const image of readyImages) {
+          blobCacheRef.current.set(image.id, image.blob);
+          await putImage(image.id, image.blob);
+        }
         history = [
           ...messages,
-          { id: createId(), role: "user", content, createdAt: now },
+          {
+            id: createId(),
+            role: "user",
+            content,
+            createdAt: now,
+            ...(readyImages.length > 0
+              ? {
+                  images: readyImages.map(({ id, width, height }) => ({
+                    id,
+                    width,
+                    height,
+                  })),
+                }
+              : {}),
+          },
         ];
       }
 
@@ -225,6 +405,7 @@ export default function ChatPage() {
       }
 
       setDraft("");
+      clearAttachments();
       setIsStreaming(true);
       setActiveAssistantId(assistantId);
       stickRef.current = true;
@@ -262,12 +443,7 @@ export default function ChatPage() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            messages: nextHistory
-              .slice(-8)
-              .map(({ role, content: messageContent }) => ({
-                role,
-                content: messageContent,
-              })),
+            messages: await buildRequestMessages(nextHistory.slice(-8)),
           }),
           signal: controller.signal,
         });
@@ -281,9 +457,11 @@ export default function ChatPage() {
           }
           dropAssistant();
           setErrorType(
-            response.status === 429 || failure?.error === "rate_limited"
-              ? "rate_limited"
-              : "server_error",
+            response.status === 413
+              ? "payload_too_large"
+              : response.status === 429 || failure?.error === "rate_limited"
+                ? "rate_limited"
+                : "server_error",
           );
           return;
         }
@@ -388,7 +566,7 @@ export default function ChatPage() {
         patchChat(chatId, (chat) => ({ ...chat, updatedAt: Date.now() }));
       }
     },
-    [activeId, messages, patchChat, stopSpeech],
+    [activeId, messages, patchChat, stopSpeech, attachments, clearAttachments, buildRequestMessages],
   );
 
   const submitDraft = useCallback(() => {
@@ -444,13 +622,22 @@ export default function ChatPage() {
         abortRef.current?.abort();
         stopSpeech();
       }
+      const target = chats.find((chat) => chat.id === chatId);
+      if (target) {
+        for (const message of target.messages) {
+          for (const image of message.images || []) {
+            blobCacheRef.current.delete(image.id);
+            void deleteImage(image.id);
+          }
+        }
+      }
       setChats((current) => current.filter((chat) => chat.id !== chatId));
       if (chatId === activeId) {
         setActiveId(null);
         setErrorType(null);
       }
     },
-    [activeId, stopSpeech],
+    [activeId, stopSpeech, chats],
   );
 
   const copyMessage = useCallback(async (message) => {
@@ -481,7 +668,22 @@ export default function ChatPage() {
     .find((message) => message.role === "assistant")?.id;
 
   return (
-    <div className="flex h-[100dvh] overflow-hidden bg-[var(--bg)] text-[var(--text)]">
+    <div
+      className="flex h-[100dvh] overflow-hidden bg-[var(--bg)] text-[var(--text)]"
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
+      {dragging ? (
+        <div
+          className="pointer-events-none fixed inset-0 z-[60] flex items-center justify-center bg-black/50"
+          aria-hidden="true"
+        >
+          <div className="rounded-3xl border-2 border-dashed border-[var(--accent)] bg-[var(--surface)] px-8 py-6 text-lg font-medium text-[var(--text)] shadow-2xl">
+            Photo yaha chhodo
+          </div>
+        </div>
+      ) : null}
       <Sidebar
         open={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
@@ -556,6 +758,10 @@ export default function ChatPage() {
                   onStop={() => abortRef.current?.abort()}
                   isStreaming={isStreaming}
                   textareaRef={textareaRef}
+                  images={attachments}
+                  onAddImages={addFiles}
+                  onRemoveImage={removeAttachment}
+                  imageError={imageError}
                 />
               </EmptyState>
             ) : (
@@ -616,6 +822,10 @@ export default function ChatPage() {
                 onStop={() => abortRef.current?.abort()}
                 isStreaming={isStreaming}
                 textareaRef={textareaRef}
+                images={attachments}
+                onAddImages={addFiles}
+                onRemoveImage={removeAttachment}
+                imageError={imageError}
               />
             </div>
           </footer>
